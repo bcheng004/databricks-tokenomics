@@ -44,6 +44,75 @@ cd databricks-tokenomics
 uv sync
 ```
 
+## MLflow tracing for Codex
+
+MLflow can capture each Codex conversation turn, including prompts, responses,
+tool calls, token usage, and Git metadata. The integration uses a Codex `notify`
+hook and requires Codex CLI and Node.js 18 or newer.
+
+Install the integration:
+
+```bash
+npm install -g @mlflow/codex
+```
+
+Authenticate to Databricks with an explicitly named profile, then run setup from
+the repository root:
+
+```bash
+databricks auth login --profile <profile-name>
+mlflow-codex setup
+```
+
+Choose the project-level `./.codex/` location when prompted. For Databricks,
+enter `databricks://<profile-name>` as the tracking URI and the ID of the MLflow
+experiment that should receive the traces. Never omit the profile name or rely
+on a default Databricks profile.
+
+Setup creates these files:
+
+- `.codex/config.toml`, which registers the hook:
+
+  ```toml
+  notify = ["mlflow-codex", "notify-hook"]
+  ```
+
+- `.codex/mlflow-tracing.json`, which stores the tracing destination:
+
+  ```json
+  {
+    "trackingUri": "databricks://<profile-name>",
+    "experimentId": "<experiment-id>"
+  }
+  ```
+
+### Store traces in Unity Catalog
+
+For Unity Catalog-backed traces, the tracking URI and experiment ID are not
+enough. Add `traceLocation` to `.codex/mlflow-tracing.json`:
+
+```json
+{
+  "trackingUri": "databricks://<profile-name>",
+  "experimentId": "<experiment-id>",
+  "traceLocation": "<catalog>.<schema>.<table-prefix>"
+}
+```
+
+The UC trace location must already be provisioned in the workspace, and the
+authenticated user must be able to write to it. The value is a three-part table
+prefix, not the name of only the spans table. For example, a prefix of
+`my_catalog.observability.codex` routes the integration to the UC trace tables
+associated with that prefix, such as `codex_otel_spans`.
+
+Restart Codex after changing its configuration, then complete a turn and check
+the experiment's **Traces** tab or the configured UC trace view. If tracing does
+not appear, verify that `mlflow-codex` is on `PATH`, the Databricks profile is
+authenticated, and the experiment and UC location exist and are accessible.
+
+See the [official MLflow Codex tracing guide](https://mlflow.org/docs/latest/genai/tracing/integrations/listing/codex/)
+for additional configuration and troubleshooting details.
+
 ## Project structure
 
 _TODO — update as the layout is created._

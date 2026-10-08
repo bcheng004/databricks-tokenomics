@@ -1,0 +1,31 @@
+# Python
+__pycache__/
+*.pyc
+.venv/
+.python-version
+
+# Node / frontend
+node_modules/
+client/build/
+client/src/fastapi_client/
+
+# Env / secrets
+.env
+.env.local
+
+# OS / editor
+.DS_Store
+.vscode/
+
+# Databricks CLI local sync state
+.databricks/
+
+# uv lock file is not committed
+uv.lock
+.omc
+.isaac
+mlflow.db
+.ruff_cache
+mlruns
+config
+blog

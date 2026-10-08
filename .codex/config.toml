@@ -1,0 +1,2 @@
+# Added by `mlflow-codex setup` — forwards each Codex turn to MLflow Tracing.
+notify = ["mlflow-codex", "notify-hook"]

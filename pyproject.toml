@@ -1,0 +1,30 @@
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[project]
+name = "databricks-tokenomics"
+version = "0.1.0"
+description = "Track and analyze the token economics of GenAI workloads on Databricks."
+requires-python = ">=3.10"
+dependencies = [
+    "databricks-sdk==0.94.0",
+    # Pinned: the trace-location API (UnityCatalog +
+    # set_experiment(trace_location=...)) is missing from the newest
+    # mlflow-skinny[databricks] resolution; re-verify before bumping.
+    "mlflow-skinny[databricks]==3.16.1",
+    "huggingface-hub>=0.34,<2",
+    "python-dotenv>=1,<2",
+    "tomli>=2; python_version < '3.11'",
+]
+
+[project.scripts]
+setup-mlflow-uc-experiment = "scripts.setup_mlflow_uc_experiment:main"
+run-officeqa = "scripts.run_officeqa:main"
+score-officeqa = "scripts.score_officeqa:main"
+
+[project.optional-dependencies]
+evaluation = ["databricks-agents>=1.12,<2", "pandas>=2,<4"]
+
+[tool.hatch.build.targets.wheel]
+packages = ["scripts"]

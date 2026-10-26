@@ -29,3 +29,5 @@ mlflow.db
 mlruns
 config
 blog
+data/
+results/

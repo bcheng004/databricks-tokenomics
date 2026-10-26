@@ -89,7 +89,9 @@ Setup creates these files:
 ### Store traces in Unity Catalog
 
 For Unity Catalog-backed traces, the tracking URI and experiment ID are not
-enough. Add `traceLocation` to `.codex/mlflow-tracing.json`:
+enough. Add `traceLocation` to `.codex/mlflow-tracing.json` (or run
+`uv run setup-mlflow-uc-experiment` from the repository root, which provisions
+the experiment and UC location and writes this file for you):
 
 ```json
 {
@@ -113,6 +115,99 @@ authenticated, and the experiment and UC location exist and are accessible.
 See the [official MLflow Codex tracing guide](https://mlflow.org/docs/latest/genai/tracing/integrations/listing/codex/)
 for additional configuration and troubleshooting details.
 
+## Run OfficeQA Pro v2
+
+Accept the gated dataset's access conditions on Hugging Face and set `HF_TOKEN`
+in your gitignored `.env` file. Install dependencies with `uv sync`.
+
+Run one question first to verify the configured MLflow destination:
+
+```bash
+uv run run-officeqa --profile <profile-name> --warehouse-id <warehouse-id> \
+  --output-dir results/officeqa-pro-v2-gpt-6-1-sol --limit 1
+```
+
+Then run all questions; the completed smoke-test question is skipped:
+
+```bash
+uv run run-officeqa --profile <profile-name> --warehouse-id <warehouse-id> \
+  --output-dir results/officeqa-pro-v2-gpt-6-1-sol --workers 2
+```
+
+The profile must match `.codex/mlflow-tracing.json`. The warehouse is used to
+query and verify Unity Catalog-backed traces; it can also be configured through
+`MLFLOW_TRACING_SQL_WAREHOUSE_ID` in the environment or `.env`.
+
+The runner downloads a pinned full dataset snapshot (including PDFs and parsed
+JSON) into `data/officeqa-pro-v2/`. It converts the entire parsed corpus into
+searchable text in `results/officeqa-pro-v2/workspace/corpus/`. Each question gets
+an independent, read-only Codex session. Prompts include only the question and
+UID, not reference answers or annotated source-document hints. The runner explicitly
+passes `--model system.ai.gpt-6-1-sol` by default rather than relying on Codex's
+model default. These sessions preserve provider and reasoning settings from the
+user's Codex config, excluding MCP servers and plugins; the agent is instructed
+to use only the local corpus.
+This is prompt-level answer-key separation, not an OS-level filesystem boundary.
+
+After each completed question, the runner exports that session through
+`mlflow-codex` exactly once, then adds and reads back the trace tags `uid`,
+`dataset` (the Hugging Face repository name), `dataset_revision`, `model`, and
+`execution_client=codex_cli`. It verifies that the trace contains LLM spans.
+Automatic notify export is disabled only for
+these child sessions to avoid duplicate traces; the project's hook is unchanged.
+
+Answers, Codex events, export logs, and trace IDs are kept under
+`results/officeqa-pro-v2/questions/<uid>/`; `summary.json` records batch status
+and token usage reported by Codex. Both `data/` and `results/` are gitignored.
+Re-running the same command resumes completed agent executions and skips
+completed traces. Ambiguous exports and interrupted agent sessions fail rather
+than silently duplicating executions; inspect their logs before retrying. Use
+`--resume-failed` to continue interrupted Codex sessions in place, preserving
+earlier attempt logs. Reduce `--workers` if the model gateway returns rate limits.
+HTTP 429 failures are retried twice in the same session after 60 and 120 seconds
+(configurable with `--rate-limit-retries` and `--retry-delay`). Persistent rate
+limits stop queued questions instead of repeatedly sending more requests.
+
+Use `--uid <uid>` to select a question, `--model <model>` to override the pinned
+model, or `--download-only` to fetch data without inference. Use a separate
+`--output-dir` for each model batch; the manifest rejects mismatched models so
+existing results cannot silently be reused for another model. To reuse a
+completed download without network checks, pass `--skip-download --revision
+<snapshot-commit-sha>`. Never commit the token or downloaded answer keys.
+
+### Score existing OfficeQA answers
+
+Use the built-in MLflow `Correctness` scorer without regenerating answers:
+
+```bash
+uv sync --extra evaluation
+uv run --extra evaluation score-officeqa --profile <profile-name> \
+  --warehouse-id <warehouse-id> --revision <snapshot-commit-sha> --limit 3
+uv run --extra evaluation score-officeqa --profile <profile-name> \
+  --warehouse-id <warehouse-id> --revision <snapshot-commit-sha>
+```
+
+The evaluator selects successful traces tagged with the dataset and
+`execution_client=codex_cli`, matches each trace's `uid` to the CSV, and supplies
+the complete `answer` as `expectations={"expected_facts": [answer]}`. It validates
+the dataset revision and rejects unknown UIDs. The revision can be read from
+`snapshot.json` when available, or passed explicitly with `--revision` using the
+commit in the question batch's manifest. Both model batches are included
+by default; use `--model <answer-model>` to filter a batch and a separate
+`--output-dir` for a different selection or judge.
+
+The judge is explicitly pinned to
+`--judge-model databricks:/databricks-claude-opus-5-5` (Claude Opus 5.5), not the
+answer-generation model or an automatically selected judge. Another judge can be selected with
+`--judge-model <provider>:/<model-name>` (additional provider dependencies may be
+needed). Standard `mlflow.genai.evaluate()` attaches `expected_facts` and
+`correctness` assessments, including the judge rationale, to the existing
+Unity Catalog traces. Evaluation runs and metrics are logged to the configured
+experiment. Assessment verification checks the judge's recorded source model.
+Verified Opus results are checkpointed separately from earlier default-judge tests in
+`results/officeqa-correctness-opus-5-5/summary.json` and skipped on subsequent invocations.
+Errors are not counted as incorrect answers and are eligible for retry.
+
 ## Project structure
 
 _TODO — update as the layout is created._
@@ -121,7 +216,9 @@ _TODO — update as the layout is created._
 databricks-tokenomics/
 ├── AGENTS.md          # Instructions for AI coding agents
 ├── README.md          # This file
+├── pyproject.toml     # Project metadata and dependencies (uv)
 ├── .gitignore
+├── scripts/           # Standalone `uv run` scripts (PEP 723 inline dependencies)
 └── ...
 ```
 

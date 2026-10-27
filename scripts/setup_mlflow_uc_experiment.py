@@ -22,11 +22,13 @@ or, via the console script registered in ``pyproject.toml``:
 
     uv run setup-mlflow-uc-experiment
 
-Configuration is read from the environment, with the notebook's values as
-defaults:
+Configuration is read from terminal prompts, command-line arguments, and the
+environment:
 
-- ``EXPERIMENT_NAME`` (default ``/Workspace/Shared/codex-traces``)
-- ``UC_SCHEMA`` (default ``codex_traces_bo``)
+- Experiment name (prompted for and created as ``/Shared/<name>``; use
+  ``--experiment-name`` or ``EXPERIMENT_NAME`` for non-interactive runs)
+- Schema name (prompted for and created in the selected catalog; use
+  ``--schema`` or ``UC_SCHEMA`` for non-interactive runs)
 - ``UC_TABLE_PREFIX`` (default ``evals``)
 - ``MLFLOW_TRACING_SQL_WAREHOUSE_ID`` (default: auto-discovered
   "Serverless Starter Warehouse")
@@ -60,14 +62,13 @@ import mlflow
 from databricks.sdk import WorkspaceClient
 from databricks.sdk.errors.platform import (
     BadRequest,
-    NotFound,
     PermissionDenied,
     ResourceAlreadyExists,
 )
 from mlflow.entities.trace_location import UnityCatalog
 
-EXPERIMENT_NAME = os.environ.get("EXPERIMENT_NAME", "/Workspace/Shared/codex-traces")
-UC_SCHEMA = os.environ.get("UC_SCHEMA", "codex_traces_bo")
+EXPERIMENT_NAME = os.environ.get("EXPERIMENT_NAME")
+UC_SCHEMA = os.environ.get("UC_SCHEMA")
 UC_TABLE_PREFIX = os.environ.get("UC_TABLE_PREFIX", "evals")
 
 
@@ -83,22 +84,21 @@ def find_default_warehouse(w: WorkspaceClient) -> str | None:
     )
 
 
-def ensure_schema(w: WorkspaceClient, catalog_name: str, schema_name: str) -> None:
-    """CREATE SCHEMA IF NOT EXISTS equivalent via the Unity Catalog API."""
+def create_schema(w: WorkspaceClient, catalog_name: str, schema_name: str) -> None:
+    """Create a new schema and refuse to reuse an existing one."""
     full_name = f"{catalog_name}.{schema_name}"
     try:
-        w.schemas.get(full_name=full_name)
-    except NotFound:
-        try:
-            w.schemas.create(catalog_name=catalog_name, name=schema_name)
-            print(f"Created schema {full_name}")
-        except (BadRequest, ResourceAlreadyExists) as e:
-            # UC reports already-exists as a 400 on this endpoint
-            if "already exists" not in str(e).lower():
-                raise
-            print(f"Schema {full_name} already exists")
-        return
-    print(f"Schema {full_name} already exists")
+        w.schemas.create(catalog_name=catalog_name, name=schema_name)
+    except (BadRequest, ResourceAlreadyExists) as error:
+        if "already exists" not in str(error).lower():
+            raise
+        sys.exit(f"Schema '{full_name}' already exists; choose a new schema name.")
+    except PermissionDenied:
+        sys.exit(
+            f"Permission denied creating schema '{full_name}'; "
+            f"request CREATE SCHEMA on catalog '{catalog_name}'."
+        )
+    print(f"Created schema {full_name}")
 
 
 def list_profiles() -> list[str]:
@@ -191,6 +191,53 @@ def resolve_catalog(w: WorkspaceClient, explicit: str | None) -> str:
         print("  Enter a number or name.")
 
 
+def resolve_experiment_name(explicit: str | None) -> str:
+    """Resolve a name and place the experiment directly under /Shared."""
+    name = explicit or EXPERIMENT_NAME
+    if name is not None:
+        name = name.strip()
+    if not name and not sys.stdin.isatty():
+        sys.exit(
+            "No experiment name given and stdin is not interactive; "
+            "pass --experiment-name or set EXPERIMENT_NAME."
+        )
+    while not name:
+        name = input("Experiment name (created under /Shared): ").strip()
+        if not name:
+            print("  Enter an experiment name.")
+    if name in {".", ".."} or "/" in name:
+        sys.exit(
+            f"Experiment name '{name}' must be a name, not a path; "
+            "the experiment is always created directly under /Shared."
+        )
+    path = f"/Shared/{name}"
+    print(f"Creating experiment: {path}")
+    return path
+
+
+def resolve_schema_name(explicit: str | None, catalog_name: str) -> str:
+    """Resolve a new schema name inside the selected catalog."""
+    name = explicit or UC_SCHEMA
+    if name is not None:
+        name = name.strip()
+    if not name and not sys.stdin.isatty():
+        sys.exit(
+            "No schema name given and stdin is not interactive; "
+            "pass --schema or set UC_SCHEMA."
+        )
+    while not name:
+        name = input(f"New schema name (created in {catalog_name}): ").strip()
+        if not name:
+            print("  Enter a schema name.")
+    if name in {".", ".."} or "." in name or "/" in name:
+        sys.exit(
+            f"Schema name '{name}' must be a name, not a qualified name or path; "
+            f"the schema is always created in catalog '{catalog_name}'."
+        )
+    print(f"Creating schema: {catalog_name}.{name}")
+    return name
+
+
 def write_tracing_config(path: Path, profile: str, experiment_id: str, trace_location: str) -> None:
     """Update the mlflow-codex destination file, preserving unknown keys."""
     config: dict = {}
@@ -220,6 +267,14 @@ def main() -> None:
         help="Unity Catalog to store traces in (prompted for if omitted)",
     )
     parser.add_argument(
+        "--experiment-name",
+        help="Name for the new /Shared experiment (prompted for if omitted)",
+    )
+    parser.add_argument(
+        "--schema",
+        help="Name for the new schema in the selected catalog (prompted for if omitted)",
+    )
+    parser.add_argument(
         "--tracing-config",
         default=".codex/mlflow-tracing.json",
         help="mlflow-codex destination file to update on success "
@@ -231,9 +286,19 @@ def main() -> None:
     os.environ["DATABRICKS_CONFIG_PROFILE"] = profile
 
     w = WorkspaceClient()
-    print(f"Authenticated as {w.current_user.me().user_name} ({w.config.host})")
+    current_user = w.current_user.me()
+    print(f"Authenticated as {current_user.user_name} ({w.config.host})")
+
+    experiment_name = resolve_experiment_name(args.experiment_name)
+    mlflow.set_tracking_uri(f"databricks://{profile}")
+    if mlflow.get_experiment_by_name(experiment_name) is not None:
+        sys.exit(
+            f"Experiment '{experiment_name}' already exists. Choose a new name with "
+            "--experiment-name or EXPERIMENT_NAME; this setup command does not reuse experiments."
+        )
 
     catalog = resolve_catalog(w, args.catalog)
+    schema = resolve_schema_name(args.schema, catalog)
 
     # Specify the ID of a SQL warehouse you have access to.
     warehouse_id = os.environ.get("MLFLOW_TRACING_SQL_WAREHOUSE_ID")
@@ -248,29 +313,28 @@ def main() -> None:
             + "\nSet MLFLOW_TRACING_SQL_WAREHOUSE_ID to choose one explicitly."
         )
 
-    ensure_schema(w, catalog, UC_SCHEMA)
+    create_schema(w, catalog, schema)
 
-    mlflow.set_tracking_uri("databricks")
     os.environ["MLFLOW_TRACING_SQL_WAREHOUSE_ID"] = warehouse_id
 
-    # mlflow.set_experiment is an upsert operation
-    experiment = mlflow.set_experiment(
-        experiment_name=EXPERIMENT_NAME,
+    experiment_id = mlflow.create_experiment(
+        name=experiment_name,
         trace_location=UnityCatalog(
             catalog_name=catalog,
-            schema_name=UC_SCHEMA,
+            schema_name=schema,
             table_prefix=UC_TABLE_PREFIX,  # defaults to experiment id if not provided
         ),
     )
+    experiment = mlflow.set_experiment(experiment_id=experiment_id)
 
-    print(f"Experiment ID: {experiment.experiment_id}")
+    print(f"Created experiment {experiment.name} ({experiment.experiment_id})")
     print(experiment.trace_location.full_otel_spans_table_name)
 
     write_tracing_config(
         Path(args.tracing_config),
         profile,
         experiment.experiment_id,
-        f"{catalog}.{UC_SCHEMA}.{UC_TABLE_PREFIX}",
+        f"{catalog}.{schema}.{UC_TABLE_PREFIX}",
     )
 
 

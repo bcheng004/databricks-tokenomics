@@ -91,7 +91,13 @@ Setup creates these files:
 For Unity Catalog-backed traces, the tracking URI and experiment ID are not
 enough. Add `traceLocation` to `.codex/mlflow-tracing.json` (or run
 `uv run setup-mlflow-uc-experiment` from the repository root, which provisions
-the experiment and UC location and writes this file for you):
+a new experiment and UC location and writes this file for you). It prompts for
+an experiment name and a new schema name. The experiment is created directly
+under `/Shared`, such as `/Shared/codex-traces`, and the schema is created in the
+selected catalog. Use `--experiment-name codex-traces --schema codex_traces_v2`
+or the `EXPERIMENT_NAME` and `UC_SCHEMA` environment variables for a
+non-interactive run. The command fails if either object already exists rather
+than silently reusing it:
 
 ```json
 {
@@ -149,10 +155,32 @@ user's Codex config, excluding MCP servers and plugins; the agent is instructed
 to use only the local corpus.
 This is prompt-level answer-key separation, not an OS-level filesystem boundary.
 
+Use `--reasoning-effort high` to set Codex's `model_reasoning_effort` explicitly.
+Supported effort levels depend on the model and Codex client. When omitted, the
+runner inherits the top-level effort setting from `$CODEX_HOME/config.toml`
+(`~/.codex/config.toml` by default). If none is configured, it records `default`,
+meaning no effort override was sent, not a measured or inferred effort level.
+Passing `--reasoning-effort default` explicitly ignores an inherited override.
+The setting is resolved once per batch and recorded in the manifest, question
+results, summary, and trace tag `reasoning_effort`. It is separate from the
+OpenJev `task_complexity` assessment and does not automatically route questions.
+
 After each completed question, the runner exports that session through
 `mlflow-codex` exactly once, then adds and reads back the trace tags `uid`,
-`dataset` (the Hugging Face repository name), `dataset_revision`, `model`, and
+`dataset` (the Hugging Face repository name), `dataset_revision`, `model`, `reasoning_effort`, and
 `execution_client=codex_cli`. It verifies that the trace contains LLM spans.
+The runner uses a repository-local adapter around the installed `mlflow-codex`
+exporter to attach the full question's Codex-reported usage to the root span as
+structured `mlflow.chat.tokenUsage`. It records `input_tokens`, `output_tokens`,
+and `total_tokens`, plus `cache_read_input_tokens` (from Codex's
+`cached_input_tokens`) and `cache_creation_input_tokens` (from
+`cache_write_input_tokens`) when reported. Missing cache counts remain absent;
+reported zeros are preserved. Cached input is already included in input tokens,
+so total tokens are input plus output without adding cached tokens again. The
+runner verifies the root span attribute and MLflow's aggregated
+`mlflow.trace.tokenUsage` metadata after export. The adapter requires Node.js
+and the installed `@mlflow/codex` package; it does not modify the global
+installation. Existing completed traces are skipped rather than backfilled.
 Automatic notify export is disabled only for
 these child sessions to avoid duplicate traces; the project's hook is unchanged.
 
@@ -170,8 +198,12 @@ limits stop queued questions instead of repeatedly sending more requests.
 
 Use `--uid <uid>` to select a question, `--model <model>` to override the pinned
 model, or `--download-only` to fetch data without inference. Use a separate
-`--output-dir` for each model batch; the manifest rejects mismatched models so
-existing results cannot silently be reused for another model. To reuse a
+`--output-dir` for each model/effort batch; the manifest rejects mismatched models
+or effort settings so existing results cannot silently be reused. Directories
+created before effort tracking also require a new `--output-dir`; historical
+runs are not relabeled using today's config. For example, use
+`--reasoning-effort high --output-dir results/officeqa-pro-v2-gpt-6-1-sol-high`.
+To reuse a
 completed download without network checks, pass `--skip-download --revision
 <snapshot-commit-sha>`. Never commit the token or downloaded answer keys.
 
@@ -213,6 +245,13 @@ experiment. Assessment verification checks the judge's recorded source model.
 Verified Opus results are checkpointed separately from earlier default-judge tests in
 `results/officeqa-correctness-opus-5-5/summary.json` and skipped on subsequent invocations.
 Errors are not counted as incorrect answers and are eligible for retry.
+If the native judge parser rejects prose before a JSON verdict, a strict fallback
+accepts only one trailing JSON object with a `yes`/`no` result and nonempty
+rationale. The original model response and parser-recovery version are preserved
+in assessment metadata. Ambiguous or malformed responses remain errors. Rerun
+the same command and output directory to retry only unfinished assessments;
+completed scores are retained, and new scores are verified on the original root
+spans with the selected judge model and evaluation run.
 
 ### Classify question difficulty with OpenJev
 

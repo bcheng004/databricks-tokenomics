@@ -11,7 +11,9 @@ from pathlib import Path
 
 import mlflow
 from dotenv import dotenv_values
-from mlflow.genai.scorers import Correctness
+from mlflow.entities import AssessmentSource, AssessmentSourceType, Feedback
+from mlflow.exceptions import MlflowException
+from mlflow.genai.scorers import Correctness, scorer
 from mlflow.tracing.constant import AssessmentMetadataKey
 
 from scripts.run_officeqa import write_json
@@ -52,7 +54,53 @@ def evaluation_row(trace, references: dict[str, dict]) -> dict:
             "outputs": response, "expectations": {"expected_facts": [reference["answer"]]}}
 
 
-def successful_assessment(info, expected_facts: list[str], run_id: str, judge_model: str):
+def recover_correctness_feedback(error: MlflowException, judge_model: str) -> Feedback:
+    prefix = "Failed to parse response from judge model. Response: "
+    message = str(error)
+    if not message.startswith(prefix):
+        raise error
+    response = message[len(prefix):]
+    start = response.find("{")
+    if start <= 0 or not response[:start].strip():
+        raise error
+
+    def unique_object(pairs):
+        result = dict(pairs)
+        if len(result) != len(pairs):
+            raise ValueError("Duplicate judge response fields")
+        return result
+
+    try:
+        payload, end = json.JSONDecoder(object_pairs_hook=unique_object).raw_decode(response, start)
+    except ValueError:
+        raise error from None
+    if (response[end:].strip() or not isinstance(payload, dict)
+            or set(payload) != {"result", "rationale"}
+            or not isinstance(payload["result"], str) or payload["result"] not in ("yes", "no")
+            or not isinstance(payload["rationale"], str) or not payload["rationale"].strip()):
+        raise error
+    return Feedback(
+        name="correctness", value=payload["result"], rationale=payload["rationale"],
+        source=AssessmentSource(source_type=AssessmentSourceType.LLM_JUDGE, source_id=judge_model),
+        metadata={"parser_recovery": "prose_prefixed_json_v1", "judge_response": response},
+    )
+
+
+def make_correctness_scorer(judge_model: str):
+    native = Correctness(model=judge_model)
+
+    @scorer(name="correctness")
+    def correctness(inputs: dict, outputs: str, expectations: dict) -> Feedback:
+        try:
+            return native(inputs=inputs, outputs=outputs, expectations=expectations)
+        except MlflowException as error:
+            return recover_correctness_feedback(error, judge_model)
+
+    return correctness
+
+
+def successful_assessment(info, expected_facts: list[str], run_id: str, judge_model: str,
+                          root_span_id: str | None = None):
     assessments = info.assessments or []
     expected = any(assessment.name == "expected_facts" and assessment.value == expected_facts
                    for assessment in assessments)
@@ -62,7 +110,9 @@ def successful_assessment(info, expected_facts: list[str], run_id: str, judge_mo
                  if assessment.name == "correctness" and assessment.error is None
                  and assessment.value in ("yes", "no")
                  and assessment.source is not None
+                 and assessment.source.source_type == AssessmentSourceType.LLM_JUDGE
                  and assessment.source.source_id == judge_model
+                 and (root_span_id is None or assessment.span_id == root_span_id)
                  and (assessment.metadata or {}).get(AssessmentMetadataKey.SOURCE_RUN_ID) == run_id),
                 None)
 
@@ -189,12 +239,13 @@ def main() -> None:
             tags={"dataset": snapshot["dataset"], "dataset_revision": snapshot["revision"],
                   "execution_client": "codex_cli", "judge_model": args.judge_model},
         ):
-            result = mlflow.genai.evaluate(data=rows, scorers=[Correctness(model=args.judge_model)])
+            result = mlflow.genai.evaluate(data=rows, scorers=[make_correctness_scorer(args.judge_model)])
         run_path = args.output_dir / f"run-{result.run_id}.json"
         write_json(run_path, {"run_id": result.run_id, "metrics": result.metrics,
                              "rows": json.loads(result.result_df.drop(columns=["trace"], errors="ignore")
                                                 .to_json(orient="records", default_handler=str))})
         expected = {row["trace"].info.trace_id: row["expectations"]["expected_facts"] for row in rows}
+        roots = {trace.info.trace_id: trace.data._get_root_span().span_id for trace in full}
         deadline = time.monotonic() + 180
         outstanding = set(expected)
         while outstanding:
@@ -202,8 +253,12 @@ def main() -> None:
                 trace_id = trace.info.trace_id
                 if trace_id not in outstanding:
                     continue
+                verified_trace = mlflow.get_trace(trace_id)
+                if verified_trace is None:
+                    continue
                 feedback = successful_assessment(
-                    trace.info, expected[trace_id], result.run_id, args.judge_model,
+                    verified_trace.info, expected[trace_id], result.run_id, args.judge_model,
+                    roots[trace_id],
                 )
                 if feedback is not None:
                     completed[trace_id] = {"uid": trace.info.tags["uid"],

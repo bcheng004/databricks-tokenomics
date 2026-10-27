@@ -120,24 +120,38 @@ def toml_value(value) -> str:
     return json.dumps(value)
 
 
+def load_codex_config() -> dict:
+    config_path = Path(os.environ.get("CODEX_HOME", Path.home() / ".codex")) / "config.toml"
+    return tomllib.loads(config_path.read_text()) if config_path.exists() else {}
+
+
+def resolve_reasoning_effort(config: dict, override: str | None = None) -> str:
+    effort = override if override is not None else config.get("model_reasoning_effort", "default")
+    if not isinstance(effort, str) or not effort.strip():
+        raise ValueError("reasoning effort must be a nonempty string")
+    return effort.strip()
+
+
 def codex_command(workspace: Path, answer: Path, model: str,
-                  resume_session: str | None = None) -> list[str]:
+                  resume_session: str | None = None, *,
+                  reasoning_effort: str | None = None) -> list[str]:
     command = [
         "codex", "exec", "--json", "--color", "never", "--sandbox", "read-only",
         "--skip-git-repo-check", "--ignore-user-config", "--cd", str(workspace),
         "--output-last-message", str(answer),
         "--config", "notify=[]", "--config", 'approval_policy="never"',
     ]
-    config_path = Path(os.environ.get("CODEX_HOME", Path.home() / ".codex")) / "config.toml"
-    if config_path.exists():
-        config = tomllib.loads(config_path.read_text())
-        for key in ("model_provider", "model_reasoning_effort", "model_reasoning_summary"):
-            if key in config:
-                command.extend(["--config", f"{key}={toml_value(config[key])}"])
-        provider = config.get("model_provider")
-        if provider in config.get("model_providers", {}):
-            value = toml_value(config["model_providers"][provider])
-            command.extend(["--config", f"model_providers.{json.dumps(provider)}={value}"])
+    config = load_codex_config()
+    for key in ("model_provider", "model_reasoning_summary"):
+        if key in config:
+            command.extend(["--config", f"{key}={toml_value(config[key])}"])
+    provider = config.get("model_provider")
+    if provider in config.get("model_providers", {}):
+        value = toml_value(config["model_providers"][provider])
+        command.extend(["--config", f"model_providers.{json.dumps(provider)}={value}"])
+    effort = resolve_reasoning_effort(config, reasoning_effort)
+    if effort != "default":
+        command.extend(["--config", f"model_reasoning_effort={toml_value(effort)}"])
     command.extend(["--model", model])
     return command + (["resume", resume_session, "-"] if resume_session else ["-"])
 
@@ -159,6 +173,29 @@ def parse_events(path: Path) -> dict:
     return result
 
 
+def trace_token_usage(usage: dict) -> dict:
+    if not usage:
+        return {}
+    fields = {
+        "input_tokens": "input_tokens",
+        "output_tokens": "output_tokens",
+        "cached_input_tokens": "cache_read_input_tokens",
+        "cache_write_input_tokens": "cache_creation_input_tokens",
+    }
+    normalized = {}
+    for source, destination in fields.items():
+        if source not in usage:
+            if source in {"input_tokens", "output_tokens"}:
+                raise ValueError(f"Codex usage is missing {source}")
+            continue
+        value = usage[source]
+        if isinstance(value, bool) or not isinstance(value, int) or value < 0:
+            raise ValueError(f"Codex usage {source} must be a nonnegative integer")
+        normalized[destination] = value
+    normalized["total_tokens"] = normalized["input_tokens"] + normalized["output_tokens"]
+    return normalized
+
+
 def find_session_traces(session_id: str, config: dict, since_ms: int) -> list:
     traces = mlflow.search_traces(
         locations=[str(config["experimentId"])],
@@ -176,6 +213,7 @@ def export_and_tag(result: dict, prompt: str, directory: Path, config: dict,
                    environment: dict, dataset: str, revision: str) -> dict:
     session_id = result["session_id"]
     since_ms = result["started_at_ms"]
+    token_usage = trace_token_usage(result.get("usage", {}))
     traces = find_session_traces(session_id, config, since_ms) if result.get("export_attempted") else []
     if not traces and not result.get("export_attempted"):
         result["export_attempted"] = True
@@ -183,10 +221,12 @@ def export_and_tag(result: dict, prompt: str, directory: Path, config: dict,
         payload = {
             "type": "agent-turn-complete", "thread-id": session_id,
             "input-messages": [prompt], "last-assistant-message": result["answer"],
+            "token-usage": token_usage,
         }
         with (directory / "export.log").open("w") as log:
             subprocess.run(
-                ["mlflow-codex", "notify-hook", json.dumps(payload)],
+                ["node", str(Path(__file__).with_name("export_codex_trace.mjs")),
+                 shutil.which("mlflow-codex"), json.dumps(payload)],
                 env=environment, stdout=log, stderr=subprocess.STDOUT,
                 timeout=180, check=True,
             )
@@ -202,6 +242,8 @@ def export_and_tag(result: dict, prompt: str, directory: Path, config: dict,
             "execution_client": "codex_cli"}
     if result.get("model"):
         tags["model"] = result["model"]
+    if result.get("reasoning_effort"):
+        tags["reasoning_effort"] = result["reasoning_effort"]
     for key, value in tags.items():
         mlflow.set_trace_tag(trace_id, key, value)
     trace = None
@@ -216,6 +258,20 @@ def export_and_tag(result: dict, prompt: str, directory: Path, config: dict,
     spans = trace.data.spans
     if not spans or not any(str(span.span_type).strip('"') == "LLM" for span in spans):
         raise RuntimeError(f"No LLM spans found in {trace_id}")
+    if token_usage:
+        root = next((span for span in spans if span.parent_id is None), None)
+        stored_usage = root.get_attribute("mlflow.chat.tokenUsage") if root is not None else None
+        if isinstance(stored_usage, str):
+            try:
+                stored_usage = json.loads(stored_usage)
+            except json.JSONDecodeError:
+                pass
+        if stored_usage != token_usage:
+            raise RuntimeError(f"Token usage did not round-trip for {trace_id}; "
+                               "not re-exporting automatically to avoid duplicates")
+        aggregated = trace.info.token_usage or {}
+        if any(aggregated.get(key) != value for key, value in token_usage.items()):
+            raise RuntimeError(f"Trace token totals did not round-trip for {trace_id}")
     result.update(trace_id=trace_id, tags=tags, span_count=len(spans), status="complete")
     result.pop("error", None)
     write_json(directory / "result.json", result)
@@ -229,7 +285,11 @@ def run_question(question: dict, args: argparse.Namespace, config: dict,
     result_path = directory / "result.json"
     result = json.loads(result_path.read_text()) if result_path.exists() else {
         **question, "dataset": args.dataset, "model": args.model, "status": "pending",
+        "reasoning_effort": args.reasoning_effort,
     }
+    if result.get("reasoning_effort") != args.reasoning_effort:
+        raise ValueError(f"Question {question['uid']} has a different or unrecorded reasoning effort; "
+                         "use a separate --output-dir")
     prompt = build_prompt(question, args.dataset)
     if result.get("status") == "complete":
         print(f"SKIP {question['uid']} {result['trace_id']}", flush=True)
@@ -260,7 +320,8 @@ def run_question(question: dict, args: argparse.Namespace, config: dict,
             with events_path.open("w") as events, \
                     (directory / "codex.log").open("w") as log:
                 process = subprocess.run(
-                    codex_command(args.output_dir / "workspace", answer_path, args.model, resume_session),
+                    codex_command(args.output_dir / "workspace", answer_path, args.model, resume_session,
+                                  reasoning_effort=args.reasoning_effort),
                     input=prompt, text=True, stdout=events, stderr=log,
                     env=environment, timeout=args.question_timeout, check=False,
                 )
@@ -320,6 +381,10 @@ def main() -> None:
     parser.add_argument("--uid", action="append", default=[])
     parser.add_argument("--model", default="system.ai.gpt-6-1-sol",
                         help="Explicit Codex model (default: %(default)s)")
+    parser.add_argument("--reasoning-effort",
+                        help="Codex effort (e.g. low, medium, high, xhigh, max, ultra; model-dependent). "
+                             "Inherits model_reasoning_effort from Codex config when omitted; "
+                             "use 'default' to leave effort to the model")
     parser.add_argument("--resume-failed", action="store_true",
                         help="Continue an interrupted Codex session without starting a new one")
     parser.add_argument("--warehouse-id", help="SQL warehouse used to verify UC-backed traces")
@@ -353,6 +418,10 @@ def main() -> None:
         revision = args.revision
     if args.download_only:
         return
+    try:
+        args.reasoning_effort = resolve_reasoning_effort(load_codex_config(), args.reasoning_effort)
+    except (OSError, ValueError) as error:
+        parser.error(str(error))
     warehouse_id = (args.warehouse_id or os.environ.get("MLFLOW_TRACING_SQL_WAREHOUSE_ID")
                     or dotenv_values(".env").get("MLFLOW_TRACING_SQL_WAREHOUSE_ID"))
     if config.get("traceLocation") and not warehouse_id:
@@ -360,7 +429,7 @@ def main() -> None:
                      "MLFLOW_TRACING_SQL_WAREHOUSE_ID")
     if warehouse_id:
         os.environ["MLFLOW_TRACING_SQL_WAREHOUSE_ID"] = warehouse_id
-    for command in ("codex", "mlflow-codex"):
+    for command in ("codex", "mlflow-codex", "node"):
         if not shutil.which(command):
             parser.error(f"Required command not found: {command}")
     questions = load_questions(args.dataset_dir / "officeqa_pro_v2.csv")
@@ -379,16 +448,20 @@ def main() -> None:
         parser.error("Another runner is already using this output directory")
     manifest = {"dataset": args.dataset, "revision": revision,
                 "tracking_uri": config["trackingUri"], "experiment_id": str(config["experimentId"]),
-                "trace_location": config.get("traceLocation"), "model": args.model}
+                "trace_location": config.get("traceLocation"), "model": args.model,
+                "reasoning_effort": args.reasoning_effort}
     manifest_path = args.output_dir / "manifest.json"
     if manifest_path.exists() and json.loads(manifest_path.read_text()) != manifest:
-        parser.error("Output directory belongs to a different dataset, revision, model, or destination")
+        lock.close()
+        parser.error("Output directory has different dataset, revision, model, effort, or destination "
+                     "settings, or predates effort tracking; use a separate --output-dir")
     write_json(manifest_path, manifest)
     prepare_corpus(args.dataset_dir, args.output_dir / "workspace")
     mlflow.set_tracking_uri(config["trackingUri"])
     environment = child_environment(config, args.profile)
     print(f"Running {len(questions)} questions, workers={args.workers}, "
-          f"model={args.model}, experiment={config['experimentId']}", flush=True)
+          f"model={args.model}, reasoning_effort={args.reasoning_effort}, "
+          f"experiment={config['experimentId']}", flush=True)
     with ThreadPoolExecutor(max_workers=args.workers) as executor:
         stopped = threading.Event()
         futures = [executor.submit(run_with_backoff, question, args, config, environment, revision, stopped)
@@ -399,11 +472,12 @@ def main() -> None:
                for path in (args.output_dir / "questions").glob("*/result.json")]
     results.sort(key=lambda result: result["uid"])
     summary = {"dataset": args.dataset, "revision": revision, "model": args.model,
+               "reasoning_effort": args.reasoning_effort,
                "total": len(results),
                "complete": sum(result["status"] == "complete" for result in results),
                "failed": sum(result["status"] != "complete" for result in results),
                "questions": [{key: result.get(key) for key in
-                              ["uid", "status", "trace_id", "span_count", "usage", "error"]}
+                              ["uid", "status", "reasoning_effort", "trace_id", "span_count", "usage", "error"]}
                              for result in results]}
     write_json(args.output_dir / "summary.json", summary)
     lock.close()

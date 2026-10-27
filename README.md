@@ -196,6 +196,12 @@ commit in the question batch's manifest. Both model batches are included
 by default; use `--model <answer-model>` to filter a batch and a separate
 `--output-dir` for a different selection or judge.
 
+To score only the latest successful trace for each UID across model batches, add
+`--latest-per-uid` and use a separate `--output-dir`, such as
+`results/officeqa-correctness-opus-5-5-latest`. Selection uses the trace start time
+and happens before checkpoint skipping or `--limit`, so older attempts are not
+scored when the latest attempt already has an assessment.
+
 The judge is explicitly pinned to
 `--judge-model databricks:/databricks-claude-opus-5-5` (Claude Opus 5.5), not the
 answer-generation model or an automatically selected judge. Another judge can be selected with
@@ -207,6 +213,44 @@ experiment. Assessment verification checks the judge's recorded source model.
 Verified Opus results are checkpointed separately from earlier default-judge tests in
 `results/officeqa-correctness-opus-5-5/summary.json` and skipped on subsequent invocations.
 Errors are not counted as incorrect answers and are eligible for retry.
+
+### Classify question difficulty with OpenJev
+
+`classify-officeqa` assigns one question-only `task_complexity` assessment to the
+latest successful trace for each selected UID. It uses the OpenJev System One
+`choice` API, not Codex's Responses API, and does not regenerate or grade answers.
+
+The versioned rubric is:
+
+- **trivial**: one explicit fact lookup, without calculation or reconciliation.
+- **low**: a few lookups and basic arithmetic or a simple aggregation.
+- **medium**: multi-step retrieval or calculation, combining tables or periods,
+  standard analytics, or unit normalization.
+- **high**: advanced mathematics/statistics, nontrivial algorithms, or extensive
+  cross-source reconciliation and entity harmonization.
+
+Only the question is sent for classification: no generated answers, reference
+answers, correctness scores, or observed token usage. These labels estimate task
+difficulty under this rubric, not measured effort or routing guarantees.
+
+Smoke-test three questions with an explicitly selected Databricks profile that
+can execute the OpenJev model service:
+
+```bash
+uv run --extra evaluation classify-officeqa --profile <profile-name> \
+  --warehouse-id <warehouse-id> --revision <snapshot-commit-sha> --limit 3
+```
+
+The default model is `system.ai.openjev-qwen35-4b`; override it with `--model`.
+Use repeated `--uid` flags to select particular tasks. Omitting `--limit`
+classifies all remaining latest traces; this is a separate, potentially billable
+run. Verified assessments with the same model and rubric are skipped on reruns.
+Results are saved in `results/officeqa-task-complexity/summary.json`; labels,
+model confidence, and all four label probabilities are attached to the original
+trace's root span. Confidence is the model's reported value, not calibrated
+accuracy. Changing the model, rubric, dataset, or destination requires a separate
+`--output-dir`. No endpoint deployment is needed; the selected workspace must
+already have a System One-compatible model service and permission to execute it.
 
 ## Project structure
 

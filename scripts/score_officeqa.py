@@ -67,6 +67,18 @@ def successful_assessment(info, expected_facts: list[str], run_id: str, judge_mo
                 None)
 
 
+def latest_traces_by_uid(traces: list) -> list:
+    latest = {}
+    for trace in traces:
+        uid = trace.info.tags["uid"]
+        previous = latest.get(uid)
+        if previous is None or (trace.info.timestamp_ms, trace.info.trace_id) > (
+            previous.info.timestamp_ms, previous.info.trace_id,
+        ):
+            latest[uid] = trace
+    return [latest[uid] for uid in sorted(latest)]
+
+
 def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--profile", required=True)
@@ -79,6 +91,8 @@ def main() -> None:
     parser.add_argument("--judge-model", default="databricks:/databricks-claude-opus-5-5",
                         help="Explicit judge model URI (default: %(default)s)")
     parser.add_argument("--model", help="Optional filter on the answer-generation model tag")
+    parser.add_argument("--latest-per-uid", action="store_true",
+                        help="Score only the latest successful trace for each question UID")
     parser.add_argument("--workers", type=int, default=2)
     parser.add_argument("--limit", type=int)
     args = parser.parse_args()
@@ -113,6 +127,8 @@ def main() -> None:
         manifest = {"dataset": snapshot["dataset"], "revision": snapshot["revision"],
                     "tracking_uri": config["trackingUri"], "experiment_id": str(config["experimentId"]),
                     "judge_model": args.judge_model, "model_filter": args.model}
+        if args.latest_per_uid:
+            manifest["latest_per_uid"] = True
         manifest_path = args.output_dir / "manifest.json"
         if manifest_path.exists() and json.loads(manifest_path.read_text()) != manifest:
             parser.error("Output directory belongs to a different dataset, judge, or destination")
@@ -144,6 +160,11 @@ def main() -> None:
                 raise ValueError(f"Unmatched reference dataset or uid: {trace.info.trace_id}")
             candidates.append(trace)
         candidates.sort(key=lambda trace: (trace.info.tags["uid"], trace.info.trace_id))
+        if args.latest_per_uid:
+            candidates = latest_traces_by_uid(candidates)
+            candidate_ids = {trace.info.trace_id for trace in candidates}
+            completed = {trace_id: assessment for trace_id, assessment in completed.items()
+                         if trace_id in candidate_ids}
         pending = [trace for trace in candidates if trace.info.trace_id not in completed]
         selected = pending[:args.limit] if args.limit else pending
         print(f"Matched {len(candidates)} traces; already scored={len(candidates) - len(pending)}, "

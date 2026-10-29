@@ -133,6 +133,7 @@ def main() -> None:
     parser.add_argument("--dataset-dir", type=Path, default=Path("data/officeqa-pro-v2"))
     parser.add_argument("--revision", help="Pinned dataset revision if snapshot.json is missing")
     parser.add_argument("--model", default="system.ai.openjev-qwen35-4b")
+    parser.add_argument("--answer-model", help="Optional filter on the answer-generation model tag")
     parser.add_argument("--output-dir", type=Path, default=Path("results/officeqa-task-complexity"))
     parser.add_argument("--uid", action="append", default=[])
     parser.add_argument("--limit", type=int)
@@ -168,6 +169,8 @@ def main() -> None:
                 "trace_location": config.get("traceLocation"), "judge_model": args.model,
                 "rubric_hash": RUBRIC_HASH, "instructions": INSTRUCTIONS, "criteria": CRITERIA,
                 "classification_scope": "question_only", "latest_per_uid": True}
+    if args.answer_model:
+        manifest["model_filter"] = args.answer_model
     args.output_dir.mkdir(parents=True, exist_ok=True)
     with (args.output_dir / ".classify.lock").open("a") as lock:
         try:
@@ -195,6 +198,8 @@ def main() -> None:
         for trace in search():
             tags = trace.info.tags
             if tags.get("execution_client") != "codex_cli" or str(trace.info.state) != "OK":
+                continue
+            if args.answer_model and tags.get("model") != args.answer_model:
                 continue
             if tags.get("dataset_revision") != snapshot["revision"] or tags.get("uid") not in questions:
                 raise ValueError(f"Unmatched dataset revision or UID: {trace.info.trace_id}")
@@ -229,8 +234,9 @@ def main() -> None:
                 result = mlflow.genai.evaluate(
                     data=rows, scorers=[make_complexity_scorer(args.profile, args.model)],
                 )
-            records = json.loads(result.result_df.drop(columns=["trace"], errors="ignore")
-                                 .to_json(orient="records", default_handler=str))
+            records = [] if result.result_df is None else json.loads(
+                result.result_df.drop(columns=["trace"], errors="ignore")
+                .to_json(orient="records", default_handler=str))
             write_json(args.output_dir / f"run-{result.run_id}.json",
                        {"run_id": result.run_id, "metrics": result.metrics, "rows": records})
             errors = [{"trace_id": row["trace_id"],

@@ -153,6 +153,8 @@ passes `--model system.ai.gpt-6-1-sol` by default rather than relying on Codex's
 model default. These sessions preserve provider and reasoning settings from the
 user's Codex config, excluding MCP servers and plugins; the agent is instructed
 to use only the local corpus.
+The runner explicitly disables Codex's hosted web-search tool so it is not sent
+to providers that do not support it.
 This is prompt-level answer-key separation, not an OS-level filesystem boundary.
 
 Use `--reasoning-effort high` to set Codex's `model_reasoning_effort` explicitly.
@@ -284,6 +286,8 @@ The default model is `system.ai.openjev-qwen35-4b`; override it with `--model`.
 Use repeated `--uid` flags to select particular tasks. Omitting `--limit`
 classifies all remaining latest traces; this is a separate, potentially billable
 run. Verified assessments with the same model and rubric are skipped on reruns.
+Use `--answer-model <model-name>` to classify only traces tagged with a particular
+answer-generation model; `--model` still selects the OpenJev judge.
 Results are saved in `results/officeqa-task-complexity/summary.json`; labels,
 model confidence, and all four label probabilities are attached to the original
 trace's root span. Confidence is the model's reported value, not calibrated

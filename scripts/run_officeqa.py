@@ -140,6 +140,7 @@ def codex_command(workspace: Path, answer: Path, model: str,
         "--skip-git-repo-check", "--ignore-user-config", "--cd", str(workspace),
         "--output-last-message", str(answer),
         "--config", "notify=[]", "--config", 'approval_policy="never"',
+        "--config", 'web_search="disabled"',
     ]
     config = load_codex_config()
     for key in ("model_provider", "model_reasoning_summary"):
@@ -300,7 +301,7 @@ def run_question(question: dict, args: argparse.Namespace, config: dict,
         previous_start = events_path.stat().st_mtime - args.question_timeout if events_path.exists() \
             else time.time()
         result.setdefault("started_at_ms", int(previous_start * 1000))
-        if events_path.exists() and not result.get("session_id"):
+        if events_path.exists():
             result.update(parse_events(events_path))
             if result.get("turn_completed") and answer_path.exists():
                 result["answer"] = answer_path.read_text().strip()

@@ -22,6 +22,7 @@ dependencies = [
 setup-mlflow-uc-experiment = "scripts.setup_mlflow_uc_experiment:main"
 run-officeqa = "scripts.run_officeqa:main"
 score-officeqa = "scripts.score_officeqa:main"
+classify-officeqa = "scripts.classify_officeqa:main"
 
 [project.optional-dependencies]
 evaluation = ["databricks-agents>=1.12,<2", "pandas>=2,<4"]

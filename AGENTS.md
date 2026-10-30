@@ -47,7 +47,9 @@ _TODO — keep this in sync as the layout is created._
 databricks-tokenomics/
 ├── AGENTS.md          # This file
 ├── README.md          # Project overview and setup
+├── pyproject.toml     # Project metadata and dependencies (uv)
 ├── .gitignore
+├── scripts/           # Standalone `uv run` scripts (PEP 723 inline dependencies)
 └── ...
 ```
 

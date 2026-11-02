@@ -18,6 +18,54 @@ _TODO — describe the deliverable._ For example:
   "who spent what, on which model, for which feature."
 - **Dashboards & alerts** — AI/BI dashboards and thresholds for spend and token trends.
 
+## OfficeQA benchmark results
+
+In our OfficeQA Pro v2 benchmark, DeepSeek V4.1 Flash 1017 answered **51 of 90
+questions correctly (56.7%)**, compared with **49 of 90 (54.4%)** for GPT-6.1 Sol.
+Estimated inference costs were **$9.55 versus $12.92**, making DeepSeek **26.1%
+less expensive per question** using a $0.07-per-DBU conversion and the rate cards
+captured for the October 29, 2026 analysis. The open-weight model consumed more
+tokens in this run, but its lower pricing and extensive cache usage kept costs
+below GPT's. The two-question accuracy gap and differing reasoning settings do
+not establish a definitive winner. Costs exclude evaluation judges, failed
+attempts, and other compute.
+
+### Accuracy and cost comparison
+
+The comparison summarizes correctness and estimated costs overall and by task
+complexity, distinguishing total spend divided by correct answers from the
+average inference cost of questions answered correctly.
+
+![OfficeQA accuracy and estimated cost comparison for DeepSeek V4.1 Flash and GPT-6.1 Sol](imgs/image%20copy.png)
+
+### Estimated cost savings
+
+DeepSeek's estimated average cost was $0.1061 per question versus $0.1436 for
+GPT-6.1 Sol, a savings of approximately $0.0375 per question.
+
+![Estimated DeepSeek cost savings relative to GPT-6.1 Sol, including 26.1 percent savings per question](imgs/image%20copy%204.png)
+
+### Inspecting a benchmark trace
+
+An MLflow trace brings the generated answer, tool calls, model and dataset tags,
+and correctness and task-complexity assessments into one view.
+
+![DeepSeek benchmark trace showing the generated answer, model tags, medium task complexity, and passing correctness assessment](imgs/image.png)
+
+### Token and cache accounting
+
+The usage breakdown separates input, output, cache-read, and cache-write tokens
+so costs can be attributed to the appropriate pricing categories.
+
+![GPT benchmark trace with the input, output, cache-read, and cache-write token breakdown](imgs/image%20copy%202.png)
+
+### Evaluating answer quality
+
+The assessment panel records the task-complexity label and the correctness
+judge's rationale alongside the answer, making individual results inspectable.
+
+![Benchmark trace showing a medium task-complexity assessment and a passing correctness assessment with the judge rationale](imgs/image%20copy%203.png)
+
 ## Prerequisites
 
 - A Databricks workspace with Unity Catalog and access to the relevant billing /
